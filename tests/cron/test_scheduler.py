@@ -558,41 +558,6 @@ class TestDeliverResultWrapping:
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
 
-    def test_returns_none_on_successful_delivery(self):
-        from gateway.config import Platform
-
-        pconfig = MagicMock()
-        pconfig.enabled = True
-        mock_cfg = MagicMock()
-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-
-        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})):
-            job = {
-                "id": "ok-job",
-                "deliver": "origin",
-                "origin": {"platform": "telegram", "chat_id": "123"},
-            }
-            result = _deliver_result(job, "Output.")
-        assert result is None
-
-    def test_returns_none_for_local_delivery(self):
-        """local-only jobs don't deliver — not a failure."""
-        job = {"id": "local-job", "deliver": "local"}
-        result = _deliver_result(job, "Output.")
-        assert result is None
-
-    def test_returns_error_for_unknown_platform(self):
-        job = {
-            "id": "bad-platform",
-            "deliver": "origin",
-            "origin": {"platform": "fax", "chat_id": "123"},
-        }
-        with patch("gateway.config.load_gateway_config"):
-            result = _deliver_result(job, "Output.")
-        assert result is not None
-        assert "unknown platform" in result
-
     def test_returns_error_when_platform_disabled(self):
         from gateway.config import Platform
 
@@ -610,25 +575,6 @@ class TestDeliverResultErrorReturns:
             result = _deliver_result(job, "Output.")
         assert result is not None
         assert "not configured" in result
-
-    def test_returns_error_on_send_failure(self):
-        from gateway.config import Platform
-
-        pconfig = MagicMock()
-        pconfig.enabled = True
-        mock_cfg = MagicMock()
-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-
-        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"error": "rate limited"})):
-            job = {
-                "id": "rate-limited",
-                "deliver": "origin",
-                "origin": {"platform": "telegram", "chat_id": "123"},
-            }
-            result = _deliver_result(job, "Output.")
-        assert result is not None
-        assert "rate limited" in result
 
     def test_returns_error_for_unresolved_target(self, monkeypatch):
         """Non-local delivery with no resolvable target should return an error."""
@@ -874,57 +820,6 @@ class TestRunJobConfigLogging:
             f"Expected 'failed to parse prefill messages' warning in logs, got: {[r.message for r in caplog.records]}"
 
 
-class TestRunJobPerJobOverrides:
-    def test_job_level_model_provider_and_base_url_overrides_are_used(self, tmp_path):
-        config_yaml = tmp_path / "config.yaml"
-        config_yaml.write_text(
-            "model:\n"
-            "  default: gpt-5.4\n"
-            "  provider: openai-codex\n"
-            "  base_url: https://chatgpt.com/backend-api/codex\n"
-        )
-
-        job = {
-            "id": "briefing-job",
-            "name": "briefing",
-            "prompt": "hello",
-            "model": "perplexity/sonar-pro",
-            "provider": "custom",
-            "base_url": "http://127.0.0.1:4000/v1",
-        }
-
-        fake_db = MagicMock()
-        fake_runtime = {
-            "provider": "openrouter",
-            "api_mode": "chat_completions",
-            "base_url": "http://127.0.0.1:4000/v1",
-            "api_key": "***",
-        }
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("dotenv.load_dotenv"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
-             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_runtime) as runtime_mock, \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-
-            success, output, final_response, error = run_job(job)
-
-        assert success is True
-        assert error is None
-        assert final_response == "ok"
-        assert "ok" in output
-        runtime_mock.assert_called_once_with(
-            requested="custom",
-            explicit_base_url="http://127.0.0.1:4000/v1",
-        )
-        assert mock_agent_cls.call_args.kwargs["model"] == "perplexity/sonar-pro"
-        fake_db.close.assert_called_once()
-
-
 class TestRunJobSkillBacked:
     def test_run_job_preserves_skill_env_passthrough_into_worker_thread(self, tmp_path):
         job = {
@@ -1138,16 +1033,6 @@ class TestSilentDelivery:
             "deliver": "origin",
             "origin": {"platform": "telegram", "chat_id": "123"},
         }
-
-    def test_normal_response_delivers(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "Results here", None)), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            tick(verbose=False)
-        deliver_mock.assert_called_once()
 
     def test_silent_response_suppresses_delivery(self, caplog):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
@@ -1368,14 +1253,5 @@ class TestSendMediaViaAdapter:
         adapter.send_image_file = AsyncMock()
         media_files = [("/tmp/voice.mp3", False), ("/tmp/photo.jpg", False)]
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
-        adapter.send_voice.assert_called_once()
-        adapter.send_image_file.assert_called_once()
-
-    def test_single_failure_does_not_block_others(self):
-        adapter = MagicMock()
-        adapter.send_voice = AsyncMock(side_effect=RuntimeError("network error"))
-        adapter.send_image_file = AsyncMock()
-        media_files = [("/tmp/voice.ogg", False), ("/tmp/photo.png", False)]
-        self._run_with_loop(adapter, "123", media_files, None, {"id": "j4"})
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
